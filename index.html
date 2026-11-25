@@ -146,6 +146,7 @@
   .mnav button { position: relative; height: 62px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font: 800 10px system-ui, sans-serif; letter-spacing: 1.5px; overflow: visible; }
   .mnav svg { width: 24px; height: 24px; stroke: #7fe8ff; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
   .mnav .badge { top: -6px; right: -2px; }
+  .newrun { all: unset; margin-top: 10px; font: 700 12px system-ui, sans-serif; color: #8fb3c4; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; padding: 6px; }
   .restile.sm { overflow: visible; } .restile.sm .badge { top: -8px; right: -6px; }
   #resBtn, #supBtn, .restile.sm, .restile { clip-path: none; }   /* sonst schneidet die Ecken-Form die Zähler-Badges ab */
   .hsel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
@@ -370,7 +371,7 @@
       <div class="row" style="gap:8px"><button id="bkGo" class="pb go" style="height:40px"></button><button id="bkClose" class="pb" style="height:40px">Close</button></div>
     </div>
     <button id="pReset" class="pb" style="height:34px;font-size:12px;opacity:.75">New game – reset all progress</button>
-    <div style="text-align:center;font:600 10px system-ui,sans-serif;color:#5d7a89;letter-spacing:1px">RESISTD · ALPHA 0.1</div>
+    <div style="text-align:center;font:600 10px system-ui,sans-serif;color:#5d7a89;letter-spacing:1px">RESISTD · ALPHA 0.2</div>
   </div></div>
 </div>
 <script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/" } }</script>
@@ -507,9 +508,29 @@ const lvl = id => meta.nodes[id] || 0;
    SIMULATION – reine Spiellogik. Ändert sich nur über tick() und Befehle.
    Die Darstellung liest nur und bekommt Effekte über S.events.
    ===================================================================== */
-function mulberry(seed) {
-  return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+function mulberry(seed) {   // Zustand liegt in f.s, damit ein gespeicherter Run genau weiterlaufen kann
+  const f = () => { let s = f.s | 0; s = s + 0x6D2B79F5 | 0; f.s = s; let t = Math.imul(s ^ s >>> 15, 1 | s);
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  f.s = seed | 0; return f;
+}
+// ===== Laufenden Run speichern (immer in der Bauphase) und fortsetzen =====
+const RUN_KEY = "resistd_run_v1";
+const RUN_SKIP = new Set(["events", "rng", "enemies", "spawnQueue", "undoStack", "dist", "grid", "special", "noBuild", "mods", "pm", "unlocked", "strike"]);
+function snapshotRun(S) {
+  const o = {}; for (const k of Object.keys(S)) if (!RUN_SKIP.has(k)) o[k] = S[k];
+  o.grid = [...S.grid.entries()]; o.special = [...S.special]; o.noBuild = [...S.noBuild]; o.rngS = S.rng.s; o.v = 1; o.hero0 = S.hero.id;
+  return o;
+}
+function saveRun(S) { try { if (S && !S.over && S.wave > 0 && !S.waveActive) localStorage.setItem(RUN_KEY, JSON.stringify(snapshotRun(S))); } catch (_) {} }
+function clearRun() { try { localStorage.removeItem(RUN_KEY); } catch (_) {} }
+function loadRun() { try { const o = JSON.parse(localStorage.getItem(RUN_KEY)); return o && o.v === 1 && o.wave > 0 ? o : null; } catch (_) { return null; } }
+function restoreRun(o) {
+  const S = newRun(o.seedId);
+  for (const k of Object.keys(o)) if (!["grid", "special", "noBuild", "rngS", "v", "hero0"].includes(k)) S[k] = o[k];
+  S.grid = new Map(o.grid); S.special = new Set(o.special); S.noBuild = new Set(o.noBuild);
+  S.rng = mulberry(o.rngS); S.events = []; S.enemies = []; S.spawnQueue = []; S.undoStack = []; S.strike = null; S.waveActive = false; S.over = false;
+  computeMods(S); recompute(S);
+  return S;
 }
 
 // Forschungseffekte – auch mitten im Run neu berechenbar
@@ -2969,7 +2990,7 @@ $("bkClose").onclick = () => { $("bk").style.display = "none"; };
 $("pReset").onclick = () => {
   const b = $("pReset");
   if (performance.now() - resetArm > 3000) { resetArm = performance.now(); b.textContent = "Really? All crystals & research are lost – tap again"; b.classList.add("warn"); b.style.opacity = 1; return; }
-  meta = Object.assign(freshMeta(), { sound: meta.sound, music: meta.music, gfx: meta.gfx }); saveMeta();
+  clearRun(); meta = Object.assign(freshMeta(), { sound: meta.sound, music: meta.music, gfx: meta.gfx }); saveMeta();
   b.textContent = "New game – reset all progress"; b.classList.remove("warn"); b.style.opacity = .75;
   closePause(); S = null; lastRun = null; showMenu();
 };
@@ -3076,11 +3097,12 @@ function showMenu() {
   if (!R.menuMode && R.look && !R.intro) R.toMenu = { t: 0, dur: 2.6, from: camera.position.clone(), look: R.look.clone() };
   closePanels(); R.menuMode = true;
   const badge = affordableResearch();
-  const hid = heroOwned(meta.hero) ? meta.hero : "kael";
+  const saved = loadRun();
+  const hid = saved && saved.hero0 ? saved.hero0 : heroOwned(meta.hero) ? meta.hero : "kael";
   overlay(`<div class="mbar"><span class="cur">💎 ${meta.crystals}</span><span class="cur">⚙ ${meta.scrap || 0}</span>${meta.shards || meta.prestige ? `<span class="cur" style="color:#d8b6ff">◆ ${meta.shards || 0}</span>` : ""}<span class="cur" style="margin-left:auto">BEST ${meta.best}</span></div>
     <div class="mlogo"><div class="t1"><span>RESIS</span><span class="td">TD</span></div><div class="t2">BUILD THE PATH OF MOST RESISTANCE</div></div>
     <div class="mhero"><div id="mCard">${fifaCard(hid, "mini")}</div><div class="chg">TAP CARD TO CHANGE HERO</div>
-      <button id="goRun" class="deploy" style="width:230px">DEPLOY</button></div>
+      ${saved ? `<button id="goCont" class="deploy" style="width:230px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;line-height:1">CONTINUE<small style="font:800 11px system-ui,sans-serif;letter-spacing:2px;opacity:.8">WAVE ${saved.wave + 1} · ${HEROES[saved.hero0] ? HEROES[saved.hero0].name.toUpperCase() : ""}</small></button><button id="goRun" class="newrun">Abandon and start a new run</button>` : `<button id="goRun" class="deploy" style="width:230px">DEPLOY</button>`}</div>
     <div class="mnav">
       <button id="goTree"><svg viewBox="0 0 24 24"><path d="M12 3v8M8.5 7.5a5 5 0 0 1 7 0M5.5 4.5a9 9 0 0 1 13 0M7 21l5-10 5 10zM9 17h6"/></svg>RESEARCH${badge ? `<span class="badge">${badge}</span>` : ""}</button>
       <button id="goHero"><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg>ARMORY${meta.lootOffer ? '<span class="badge">!</span>' : ""}</button>
@@ -3093,7 +3115,11 @@ function showMenu() {
       <div class="row" style="margin-top:6px"><button id="gfxBtn">Graphics: ${{ auto: "Auto", high: "High", low: "Low" }[meta.gfx || "auto"]}</button></div>
       <div class="row" style="margin-top:6px"><button id="wipe" style="font-size:12px">Reset progress</button><button id="closeSet" class="go">Done</button></div>
     </div>`, "menu menu2");
-  $("goRun").onclick = () => { meta.hero = hid; demolishThen(startRun); };
+  $("goRun").onclick = e => {
+    if (saved && !e.currentTarget.dataset.arm) { e.currentTarget.dataset.arm = 1; e.currentTarget.textContent = "Tap again – your current run is lost"; return; }
+    meta.hero = hid; demolishThen(() => startRun());
+  };
+  if ($("goCont")) $("goCont").onclick = () => { const o = loadRun(); demolishThen(() => startRun(o)); };
   $("mCard").onclick = () => { hideOverlay(); selHero = hid; showHeroSelect(); };
   $("goTree").onclick = () => { hideOverlay(); showTree(); };
   $("goHero").onclick = () => { hideOverlay(); showArmory(meta.hero || "kael"); };
@@ -3106,7 +3132,7 @@ function showMenu() {
   $("gfxBtn").onclick = () => { meta.gfx = { auto: "high", high: "low", low: "auto" }[meta.gfx || "auto"]; saveMeta(); applyGfx(meta.gfx === "low" ? "low" : "high"); $("gfxBtn").textContent = "Graphics: " + { auto: "Auto", high: "High", low: "Low" }[meta.gfx]; };
   $("wipe").onclick = e => {
     const b = e.currentTarget;
-    if (b.dataset.arm) { meta = { crystals: 0, nodes: {}, best: 0, runs: 0, tut: 0, sound: meta.sound, gfx: meta.gfx, hero: "kael", heroes: { kael: 1 }, kit: {}, loadout: {}, scrap: 0, pn: {}, prestige: 0, shards: 0 }; saveMeta(); showMenu(); }
+    if (b.dataset.arm) { clearRun(); meta = Object.assign(freshMeta(), { sound: meta.sound, music: meta.music, gfx: meta.gfx }); saveMeta(); showMenu(); }
     else { b.dataset.arm = 1; b.textContent = "Tap again to delete"; b.classList.add("warn"); }
   };
 }
@@ -3454,6 +3480,7 @@ function showTree() {
   $("go").onclick = () => { if (treeInRun) return resume(); $("screen").dataset.view = ""; hideScreen(); demolishThen(startRun); };
 }
 function onRunOver() {
+  clearRun();
   const c = crystalsFor(S);
   meta.crystals += Math.max(0, c - S.paid); S.paid = c;
   if (S.grid.size) meta.lastMaze = { cols: S.cols, rows: S.rows, cells: [...S.grid.keys()] };
@@ -3560,11 +3587,12 @@ function showCards() {
     R.lootDelay = 0;   // die Beute (genau 1 pro Boss-Kill, siehe S.lootOwed) öffnet die Hauptschleife
   };
 }
-function startRun() {
+function startRun(resume) {
   const fromMenu = !!R.menuMode;   // erst merken, dann zurücksetzen
   R.menuMode = false; R.toMenu = null;
   const fromPos = camera.position.clone(), fromLook = (R.look || camT).clone();
-  S = newRun((Date.now() ^ (Math.random() * 1e9)) | 0);
+  if (resume) { try { if (resume.hero0) meta.hero = resume.hero0; S = restoreRun(resume); } catch (err) { console.error(err); resume = null; } }
+  if (!resume) { clearRun(); S = newRun((Date.now() ^ (Math.random() * 1e9)) | 0); }
   R.popups = []; selected = -1; speed = 1; $("speedBtn").textContent = "» x1";
   cmdQueue.length = 0; acc = 0;
   hideOverlay(); buildTools(); closePanels(); hideScreen(); buildWorld(); resize(); buildDevBar();
@@ -3585,6 +3613,12 @@ function loop(now) {
   try { frame(now); } catch (err) { if ((R.loopErr = (R.loopErr || 0) + 1) < 4) console.error(err); }
   requestAnimationFrame(loop);
 }
+function maybeSaveRun(real) {
+  if (!S || S.over || S.waveActive || S.wave < 1 || R.menuMode) return;
+  const sig = S.wave + ":" + S.gridVer + ":" + Math.floor(S.gold) + ":" + S.lives + ":" + (S.cardsTaken || []).length;
+  if ((R.runSaveT = (R.runSaveT || 0) + real) > 0.3 && sig !== R.runSig) { R.runSaveT = 0; R.runSig = sig; saveRun(S); }
+}
+addEventListener("pagehide", () => { saveRun(S); saveMeta(); }); document.addEventListener("visibilitychange", () => { if (document.hidden) saveRun(S); });
 function frame(now) {
   const real = Math.min(0.1, (now - last) / 1000); last = now;
   if (S && $("screen").style.display !== "flex" && $("over").style.display !== "flex" && !paused && !demolishing) {
@@ -3609,12 +3643,13 @@ function frame(now) {
   const ms = !S || $("over").style.display === "flex" || S.over ? "menu" : S.waveActive ? (waveKind(S.wave) === "boss" ? "boss" : "fight") : "build";
   if (ms !== R.musState) { R.musState = ms; SFX.music(ms); }
   // ein Fehler in der Darstellung darf nie das ganze Spiel einfrieren
+  maybeSaveRun(real);
   try { refreshHud(real); draw(real); } catch (err) { if ((R.drawErr = (R.drawErr || 0) + 1) < 4) console.error(err); }
 }
 window.addEventListener("resize", resize);
 resize(); showMenu(); requestAnimationFrame(loop);
 window.dbg = { R, camera, s2w: p => s2w(p), worldToCell: (p) => worldToCell(S, p), cam(x, z, d) { camT.set(x, 0, z); camD = camDGoal = d; }, get S() { return S; }, set S(v) { S = v; }, applyCommand, tick, startWave, newRun, idxOf, cx, cy, checkPlacement, recompute,
-  typeUpCost, TOWERS, PERKS, waveDef, drainEvents, crystalsFor, get meta() { return meta; }, set meta(v) { meta = v; }, showMenu, showTree, startRun, cmdQueue, CELL, SFX, BAL, NODES, NODE, nodeCost, computeMods, widenMap, addPowerFields, mapCols, HEROES, BOSSES, rollCards, shardGain, spawnEnemy, center, KIT, kitMods, rollLoot, proj, heroHit, hurt, cellW, addIncome, openArmoryInRun, showArmory, showLoot, showPrestige, showHeroSelect };
+  typeUpCost, TOWERS, PERKS, waveDef, drainEvents, crystalsFor, get meta() { return meta; }, set meta(v) { meta = v; }, showMenu, showTree, startRun, cmdQueue, CELL, SFX, BAL, NODES, NODE, nodeCost, computeMods, widenMap, addPowerFields, mapCols, HEROES, BOSSES, rollCards, shardGain, spawnEnemy, center, KIT, kitMods, rollLoot, proj, heroHit, hurt, cellW, addIncome, saveRun, loadRun, restoreRun, openArmoryInRun, showArmory, showLoot, showPrestige, showHeroSelect };
 </script>
 </body>
 </html>
